@@ -101,11 +101,37 @@ impl Llama<f32> {
             let full_k = &mut cache.k_cache(layer, 0); // (total_seq, n_kv_h * dqkv)
             let full_v = &mut cache.v_cache(layer, 0); // (total_seq, n_kv_h * dqkv)
 
-            todo!("self_attention(...)");
-            todo!("down_proj matmul and add residual");
-
-            todo!("mlp(...)");
+            // todo!("self_attention(...)");
+            self_attention(
+                &mut hidden_states,
+                &mut att_scores,
+                q,
+                full_k,
+                full_v,
+                self.n_kv_h,
+                n_groups,
+                seq_len,
+                total_seq_len,
+                self.dqkv,
+            );
+            // todo!("down_proj matmul and add residual");
+            // 投影并加残差
+            OP::matmul_transb(&mut residual, 1., &hidden_states, &self.params.wo[layer], 1.0);
+            // todo!("mlp(...)");
+            // 调用MLP
+            mlp(
+                &mut residual,
+                &mut hidden_states,
+                &mut gate_buf,
+                &mut up_buf,
+                &self.params.w_up[layer],
+                &self.params.w_down[layer],
+                &self.params.w_gate[layer],
+                &self.params.rms_ffn_w[layer],
+                self.eps,
+            );
         }
+    }
 
         // No matter what seq_len, the output is always a 1D vector of length vocab,
         // which contains the probabilities for the next token.
@@ -135,8 +161,20 @@ impl Llama<f32> {
     ) -> Vec<u32>{
         let mut result = Vec::<u32>::new();
         
-        todo!("实现文本生成");
-        
+        // todo!("实现文本生成");
+        let mut cache = self.new_cache();
+        let mut current_input = token_ids.to_vec();
+
+        while result.len() < max_len {
+            let input_tensor = Tensor::new(current_input.clone(), &vec![current_input.len()]);
+            let logits = self.forward(&input_tensor, &mut cache);
+            let next_token = OP::sample_top_p_top_k(&logits, top_p, top_k, temperature);
+            result.push(next_token);
+            if next_token == self.eos_token_id {
+                break;
+            }
+            current_input = vec![next_token];
+        }
         result
     }
 }
@@ -153,7 +191,56 @@ fn self_attention(
     total_seq_len: usize,
     dqkv: usize,
 ) {
-    todo!("Implement self_attention");
+     // 重塑Q为 (seq_len, n_kv_h, n_groups, dqkv)
+     let q_reshaped = q.reshape(&vec![seq_len, n_kv_h, n_groups, dqkv]);
+     let k_reshaped = k.reshape(&vec![total_seq_len, n_kv_h, dqkv]);
+     let v_reshaped = v.reshape(&vec![total_seq_len, n_kv_h, dqkv]);
+ 
+     // 计算注意力得分
+     for i in 0..n_kv_h {
+         for j in 0..n_groups {
+             let q_head = q_reshaped.slice(i * n_groups * dqkv + j * dqkv, &vec![seq_len, dqkv]);
+             let k_head = k_reshaped.slice(i * dqkv, &vec![total_seq_len, dqkv]);
+             let mut score = att_scores.slice(
+                 i * n_groups * seq_len * total_seq_len + j * seq_len * total_seq_len,
+                 &vec![seq_len, total_seq_len],
+             );
+             OP::matmul_transb(&mut score, 0., &q_head, &k_head, 1.0 / (dqkv as f32).sqrt());
+         }
+     }
+ 
+     // 应用Softmax
+     for i in 0..n_kv_h {
+         for j in 0..n_groups {
+             let mut score = att_scores.slice(
+                 i * n_groups * seq_len * total_seq_len + j * seq_len * total_seq_len,
+                 &vec![seq_len, total_seq_len],
+             );
+             OP::softmax(&mut score);
+         }
+     }
+     // 计算attn_V
+    let mut attn_v = Tensor::<f32>::default(&vec![seq_len, n_kv_h, n_groups, dqkv]);
+    for i in 0..n_kv_h {
+        for j in 0..n_groups {
+            let attn = att_scores.slice(
+                i * n_groups * seq_len * total_seq_len + j * seq_len * total_seq_len,
+                &vec![seq_len, total_seq_len],
+            );
+            let v_head = v_reshaped.slice(i * dqkv, &vec![total_seq_len, dqkv]);
+            let mut attn_v_head = attn_v.slice(
+                i * n_groups * dqkv + j * dqkv,
+                &vec![seq_len, dqkv],
+            );
+            OP::matmul(&mut attn_v_head, 0., &attn, &v_head, 1.0);
+        }
+    }
+
+    // 重塑attn_v回 (seq, n_q_h * dqkv)
+    attn_v.reshape(&vec![seq_len, n_kv_h * n_groups * dqkv]).clone_into(hidden_states);
+}
+
+    // todo!("Implement self_attention");
 }
 
 fn mlp(
