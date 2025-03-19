@@ -21,23 +21,29 @@ impl<T: Default + Copy> KVCache<T> {
                 .collect(),
             max_seq_len: max_seq_len,
             dim: dim,
-            length: init_len,
+            length: init_len.min(max_seq_len),
         }
     }
 
     pub fn k_cache(&mut self, layer: usize, start: usize) -> Tensor<T> {
-        self.k_cache[layer].slice(start * self.dim, &vec![self.length - start, self.dim])
+        let len = (self.length - start).min(self.max_seq_len - start);
+        self.k_cache[layer].slice(start * self.dim, &vec![len, self.dim])
     }
 
     pub fn v_cache(&mut self, layer: usize, start: usize) -> Tensor<T> {
-        self.v_cache[layer].slice(start * self.dim, &vec![self.length - start, self.dim])
+        let len = (self.length - start).min(self.max_seq_len - start);
+        self.v_cache[layer].slice(start * self.dim, &vec![len, self.dim])
     }
 
-    pub fn increment(&mut self, seq_len: usize){
-        self.length += seq_len;
+    pub fn increment(&mut self, seq_len: usize) {
+        self.length = (self.length + seq_len).min(self.max_seq_len);
     }
 
     pub fn len(&self) -> usize {
         self.length
+    }
+
+    pub fn clear(&mut self) {
+        self.length = 0;
     }
 }

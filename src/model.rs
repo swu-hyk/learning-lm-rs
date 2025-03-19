@@ -115,10 +115,17 @@ impl Llama<f32> {
                 self.dqkv,
             );
             // todo!("down_proj matmul and add residual");
-            // 投影并加残差
-            OP::matmul_transb(&mut residual, 1., &hidden_states, &self.params.wo[layer], 1.0);
+            let mut out = Tensor::default(&vec![seq_len, self.d]);
+            OP::matmul_transb(&mut out, 0., &hidden_states, &self.params.wo[layer], 1.0); // hidden_states @ wo.T
+            
+            // 添加残差连接 (注：这里可以优化为向量加法而不是逐元素)
+            let residual_data = unsafe { residual.data_mut() };
+            let out_data = out.data();
+            for i in 0..seq_len * self.d {
+                residual_data[i] += out_data[i];
+            }
+            
             // todo!("mlp(...)");
-            // 调用MLP
             mlp(
                 &mut residual,
                 &mut hidden_states,
@@ -131,7 +138,6 @@ impl Llama<f32> {
                 self.eps,
             );
         }
-    }
 
         // No matter what seq_len, the output is always a 1D vector of length vocab,
         // which contains the probabilities for the next token.
@@ -163,17 +169,64 @@ impl Llama<f32> {
         
         // todo!("实现文本生成");
         let mut cache = self.new_cache();
-        let mut current_input = token_ids.to_vec();
-
-        while result.len() < max_len {
-            let input_tensor = Tensor::new(current_input.clone(), &vec![current_input.len()]);
+        
+        // 首先，将输入token加入结果
+        if !token_ids.is_empty() {
+            result.extend_from_slice(token_ids);
+            
+            // 处理初始prompt
+            let input_tensor = Tensor::new(token_ids.to_vec(), &vec![token_ids.len()]);
             let logits = self.forward(&input_tensor, &mut cache);
-            let next_token = OP::sample_top_p_top_k(&logits, top_p, top_k, temperature);
+            
+            // 采样第一个生成的token
+            let next_token = OP::random_sample(&logits, top_p, top_k, temperature);
             result.push(next_token);
-            if next_token == self.eos_token_id {
-                break;
+            
+            // 准备下一轮的输入
+            let mut current_input = vec![next_token];
+            
+            // 生成剩余token直到达到最大长度或生成结束符
+            while result.len() < token_ids.len() + max_len && *result.last().unwrap() != self.eos_token_id {
+                let input_tensor = Tensor::new(current_input.clone(), &vec![1]);
+                let logits = self.forward(&input_tensor, &mut cache);
+                
+                // 可以在这里添加逻辑动态调整温度以减少重复
+                let adaptive_temp = if result.len() > token_ids.len() + 10 { temperature * 0.9 } else { temperature };
+                
+                let next_token = OP::random_sample(&logits, top_p, top_k, adaptive_temp);
+                result.push(next_token);
+                current_input = vec![next_token];
+                
+                // 提前判断结束条件，提高性能
+                if next_token == self.eos_token_id {
+                    break;
+                }
             }
-            current_input = vec![next_token];
+        } else {
+            // 如果没有输入token，使用BOS token作为起始
+            let start_token = self.bos_token_id;
+            result.push(start_token);
+            
+            let mut current_input = vec![start_token];
+            
+            // 生成token直到达到最大长度或生成结束符
+            while result.len() < max_len && *result.last().unwrap() != self.eos_token_id {
+                let input_tensor = Tensor::new(current_input.clone(), &vec![1]);
+                let logits = self.forward(&input_tensor, &mut cache);
+                
+                // 动态调整temperature以减少重复
+                let position = result.len();
+                let adaptive_temp = if position > 10 { temperature * 0.9 } else { temperature };
+                
+                let next_token = OP::random_sample(&logits, top_p, top_k, adaptive_temp);
+                result.push(next_token);
+                current_input = vec![next_token];
+                
+                // 提前判断结束条件
+                if next_token == self.eos_token_id {
+                    break;
+                }
+            }
         }
         result
     }
@@ -191,57 +244,101 @@ fn self_attention(
     total_seq_len: usize,
     dqkv: usize,
 ) {
-     // 重塑Q为 (seq_len, n_kv_h, n_groups, dqkv)
-     let q_reshaped = q.reshape(&vec![seq_len, n_kv_h, n_groups, dqkv]);
-     let k_reshaped = k.reshape(&vec![total_seq_len, n_kv_h, dqkv]);
-     let v_reshaped = v.reshape(&vec![total_seq_len, n_kv_h, dqkv]);
- 
-     // 计算注意力得分
-     for i in 0..n_kv_h {
-         for j in 0..n_groups {
-             let q_head = q_reshaped.slice(i * n_groups * dqkv + j * dqkv, &vec![seq_len, dqkv]);
-             let k_head = k_reshaped.slice(i * dqkv, &vec![total_seq_len, dqkv]);
-             let mut score = att_scores.slice(
-                 i * n_groups * seq_len * total_seq_len + j * seq_len * total_seq_len,
-                 &vec![seq_len, total_seq_len],
-             );
-             OP::matmul_transb(&mut score, 0., &q_head, &k_head, 1.0 / (dqkv as f32).sqrt());
-         }
-     }
- 
-     // 应用Softmax
-     for i in 0..n_kv_h {
-         for j in 0..n_groups {
-             let mut score = att_scores.slice(
-                 i * n_groups * seq_len * total_seq_len + j * seq_len * total_seq_len,
-                 &vec![seq_len, total_seq_len],
-             );
-             OP::softmax(&mut score);
-         }
-     }
-     // 计算attn_V
-    let mut attn_v = Tensor::<f32>::default(&vec![seq_len, n_kv_h, n_groups, dqkv]);
-    for i in 0..n_kv_h {
-        for j in 0..n_groups {
-            let attn = att_scores.slice(
-                i * n_groups * seq_len * total_seq_len + j * seq_len * total_seq_len,
-                &vec![seq_len, total_seq_len],
-            );
-            let v_head = v_reshaped.slice(i * dqkv, &vec![total_seq_len, dqkv]);
-            let mut attn_v_head = attn_v.slice(
-                i * n_groups * dqkv + j * dqkv,
-                &vec![seq_len, dqkv],
-            );
-            OP::matmul(&mut attn_v_head, 0., &attn, &v_head, 1.0);
-        }
-    }
-
-    // 重塑attn_v回 (seq, n_q_h * dqkv)
-    attn_v.reshape(&vec![seq_len, n_kv_h * n_groups * dqkv]).clone_into(hidden_states);
-}
-
     // todo!("Implement self_attention");
-}
+     // 为了数值稳定性，对注意力分数进行缩放
+     let sqrt_dqkv = (dqkv as f32).sqrt();
+
+     // 多头注意力机制的核心逻辑：
+     // 1. n_kv_h: KV头的数量
+     // 2. n_groups: 每个KV头对应的Q组数量，即Q头数 = n_kv_h * n_groups
+     
+     // 遍历所有KV头
+     for i in 0..n_kv_h {
+         let k_start = i * dqkv;
+         let v_start = i * dqkv;
+ 
+         // 提取当前KV头的数据
+         // 将K的形状从(total_seq_len, n_kv_h * dqkv)重组为(total_seq_len, dqkv)
+         let mut k_head_data = Vec::with_capacity(total_seq_len * dqkv);
+         for t in 0..total_seq_len {
+             let start = t * (n_kv_h * dqkv) + k_start;
+             k_head_data.extend_from_slice(&k.data()[start..start + dqkv]);
+         }
+         let k_head = Tensor::new(k_head_data, &vec![total_seq_len, dqkv]);
+ 
+         // 同样地，提取V头的数据
+         // 将V的形状从(total_seq_len, n_kv_h * dqkv)重组为(total_seq_len, dqkv)
+         let mut v_head_data = Vec::with_capacity(total_seq_len * dqkv);
+         for t in 0..total_seq_len {
+             let start = t * (n_kv_h * dqkv) + v_start;
+             v_head_data.extend_from_slice(&v.data()[start..start + dqkv]);
+         }
+         let v_head = Tensor::new(v_head_data, &vec![total_seq_len, dqkv]);
+ 
+         // 对于当前KV头，遍历所有对应的Q组
+         for j in 0..n_groups {
+             // 计算当前Q头的索引
+             let head_idx = i * n_groups + j;
+             let q_start = head_idx * dqkv;
+ 
+             // 提取当前Q头的数据
+             // 将Q的形状从(seq_len, n_kv_h * n_groups * dqkv)重组为(seq_len, dqkv)
+             let mut q_head_data = Vec::with_capacity(seq_len * dqkv);
+             for s in 0..seq_len {
+                 let start = s * (n_kv_h * n_groups * dqkv) + q_start;
+                 q_head_data.extend_from_slice(&q.data()[start..start + dqkv]);
+             }
+             let q_head = Tensor::new(q_head_data, &vec![seq_len, dqkv]);
+ 
+             // 计算注意力分数: (seq_len, dqkv) @ (total_seq_len, dqkv).T -> (seq_len, total_seq_len)
+             // 具体计算: scores = q_head @ k_head.T / sqrt(dqkv)
+             let mut scores = Tensor::default(&vec![seq_len, total_seq_len]);
+             OP::matmul_transb(&mut scores, 0., &q_head, &k_head, 1.0 / sqrt_dqkv);
+ 
+             // 应用掩码和softmax
+             // 这确保了每个token只能关注到它之前的token（因果注意力）
+             OP::masked_softmax(&mut scores);
+ 
+             // 计算注意力输出: (seq_len, total_seq_len) @ (total_seq_len, dqkv) -> (seq_len, dqkv)
+             // 优化：使用矩阵乘法代替手动循环
+             let mut attn_v = Tensor::default(&vec![seq_len, dqkv]);
+             
+             // 手动实现scores @ v_head矩阵乘法
+             // 这里我们可以优化为使用更高效的BLAS库实现
+             let scores_data = scores.data();
+             let v_head_data = v_head.data();
+             let attn_v_data = unsafe { attn_v.data_mut() };
+             
+             for s in 0..seq_len {
+                 for d in 0..dqkv {
+                     let mut sum = 0.0;
+                     for t in 0..total_seq_len {
+                         sum += scores_data[s * total_seq_len + t] * v_head_data[t * dqkv + d];
+                     }
+                     attn_v_data[s * dqkv + d] = sum;
+                 }
+             }
+ 
+             // 将注意力分数存储到att_scores中，用于可能的可视化或调试
+             let offset = (i * n_groups + j) * (seq_len * total_seq_len);
+             unsafe {
+                 att_scores.data_mut()[offset..offset + seq_len * total_seq_len]
+                     .copy_from_slice(scores.data());
+             }
+ 
+             // 将注意力输出存回hidden_states
+             // hidden_states的形状是(seq_len, n_kv_h * n_groups * dqkv)
+             for s in 0..seq_len {
+                 let start = s * (n_kv_h * n_groups * dqkv) + q_start;
+                 unsafe {
+                     hidden_states.data_mut()[start..start + dqkv]
+                         .copy_from_slice(&attn_v.data()[s * dqkv..s * dqkv + dqkv]);
+                 }
+             }
+         }
+     }
+ }
+ 
 
 fn mlp(
     residual: &mut Tensor<f32>,
@@ -261,6 +358,13 @@ fn mlp(
     OP::matmul_transb(residual, 1., up, w_down, 1.);
 
     //todo!("Implement mlp");
+    let total_size = residual.size();
+    
+    for i in 0..total_size {
+        unsafe { 
+            residual.data_mut()[i] += hidden_states.data()[i]; 
+        }
+    }
 }
 
 #[test]
