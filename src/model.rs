@@ -118,7 +118,7 @@ impl Llama<f32> {
             let mut out = Tensor::default(&vec![seq_len, self.d]);
             OP::matmul_transb(&mut out, 0., &hidden_states, &self.params.wo[layer], 1.0); // hidden_states @ wo.T
             
-            // 添加残差连接 (注：这里可以优化为向量加法而不是逐元素)
+            // 添加残差连接
             let residual_data = unsafe { residual.data_mut() };
             let out_data = out.data();
             for i in 0..seq_len * self.d {
@@ -190,26 +190,25 @@ impl Llama<f32> {
                 let input_tensor = Tensor::new(current_input.clone(), &vec![1]);
                 let logits = self.forward(&input_tensor, &mut cache);
                 
-                // 可以在这里添加逻辑动态调整温度以减少重复
+            
                 let adaptive_temp = if result.len() > token_ids.len() + 10 { temperature * 0.9 } else { temperature };
                 
                 let next_token = OP::random_sample(&logits, top_p, top_k, adaptive_temp);
                 result.push(next_token);
                 current_input = vec![next_token];
                 
-                // 提前判断结束条件，提高性能
+            
                 if next_token == self.eos_token_id {
                     break;
                 }
             }
         } else {
-            // 如果没有输入token，使用BOS token作为起始
+      
             let start_token = self.bos_token_id;
             result.push(start_token);
             
             let mut current_input = vec![start_token];
-            
-            // 生成token直到达到最大长度或生成结束符
+        
             while result.len() < max_len && *result.last().unwrap() != self.eos_token_id {
                 let input_tensor = Tensor::new(current_input.clone(), &vec![1]);
                 let logits = self.forward(&input_tensor, &mut cache);
@@ -252,13 +251,9 @@ fn self_attention(
      // 1. n_kv_h: KV头的数量
      // 2. n_groups: 每个KV头对应的Q组数量，即Q头数 = n_kv_h * n_groups
      
-     // 遍历所有KV头
      for i in 0..n_kv_h {
          let k_start = i * dqkv;
          let v_start = i * dqkv;
- 
-         // 提取当前KV头的数据
-         // 将K的形状从(total_seq_len, n_kv_h * dqkv)重组为(total_seq_len, dqkv)
          let mut k_head_data = Vec::with_capacity(total_seq_len * dqkv);
          for t in 0..total_seq_len {
              let start = t * (n_kv_h * dqkv) + k_start;
@@ -266,7 +261,6 @@ fn self_attention(
          }
          let k_head = Tensor::new(k_head_data, &vec![total_seq_len, dqkv]);
  
-         // 同样地，提取V头的数据
          // 将V的形状从(total_seq_len, n_kv_h * dqkv)重组为(total_seq_len, dqkv)
          let mut v_head_data = Vec::with_capacity(total_seq_len * dqkv);
          for t in 0..total_seq_len {
@@ -277,12 +271,8 @@ fn self_attention(
  
          // 对于当前KV头，遍历所有对应的Q组
          for j in 0..n_groups {
-             // 计算当前Q头的索引
              let head_idx = i * n_groups + j;
              let q_start = head_idx * dqkv;
- 
-             // 提取当前Q头的数据
-             // 将Q的形状从(seq_len, n_kv_h * n_groups * dqkv)重组为(seq_len, dqkv)
              let mut q_head_data = Vec::with_capacity(seq_len * dqkv);
              for s in 0..seq_len {
                  let start = s * (n_kv_h * n_groups * dqkv) + q_start;
@@ -294,17 +284,10 @@ fn self_attention(
              // 具体计算: scores = q_head @ k_head.T / sqrt(dqkv)
              let mut scores = Tensor::default(&vec![seq_len, total_seq_len]);
              OP::matmul_transb(&mut scores, 0., &q_head, &k_head, 1.0 / sqrt_dqkv);
- 
-             // 应用掩码和softmax
-             // 这确保了每个token只能关注到它之前的token（因果注意力）
              OP::masked_softmax(&mut scores);
  
              // 计算注意力输出: (seq_len, total_seq_len) @ (total_seq_len, dqkv) -> (seq_len, dqkv)
-             // 优化：使用矩阵乘法代替手动循环
              let mut attn_v = Tensor::default(&vec![seq_len, dqkv]);
-             
-             // 手动实现scores @ v_head矩阵乘法
-             // 这里我们可以优化为使用更高效的BLAS库实现
              let scores_data = scores.data();
              let v_head_data = v_head.data();
              let attn_v_data = unsafe { attn_v.data_mut() };
@@ -319,14 +302,12 @@ fn self_attention(
                  }
              }
  
-             // 将注意力分数存储到att_scores中，用于可能的可视化或调试
              let offset = (i * n_groups + j) * (seq_len * total_seq_len);
              unsafe {
                  att_scores.data_mut()[offset..offset + seq_len * total_seq_len]
                      .copy_from_slice(scores.data());
              }
- 
-             // 将注意力输出存回hidden_states
+
              // hidden_states的形状是(seq_len, n_kv_h * n_groups * dqkv)
              for s in 0..seq_len {
                  let start = s * (n_kv_h * n_groups * dqkv) + q_start;
